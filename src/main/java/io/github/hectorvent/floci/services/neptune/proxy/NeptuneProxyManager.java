@@ -16,8 +16,9 @@ public class NeptuneProxyManager {
 
     private final ConcurrentHashMap<String, NeptuneGremlinProxy> proxies = new ConcurrentHashMap<>();
 
-    public void startProxy(String clusterId, int proxyPort, String backendHost, int backendPort) {
-        NeptuneGremlinProxy proxy = new NeptuneGremlinProxy(clusterId, backendHost, backendPort);
+    public void startProxy(String clusterId, int proxyPort, String backendHost, int backendPort,
+                           NeptuneLoaderEndpoint loaderEndpoint) {
+        NeptuneGremlinProxy proxy = new NeptuneGremlinProxy(clusterId, backendHost, backendPort, loaderEndpoint);
         try {
             proxy.start(proxyPort);
             proxies.put(clusterId, proxy);

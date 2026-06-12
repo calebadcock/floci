@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.neptune.container.NeptuneContainerHandle;
 import io.github.hectorvent.floci.services.neptune.container.NeptuneContainerManager;
+import io.github.hectorvent.floci.services.neptune.loader.NeptuneBulkLoader;
 import io.github.hectorvent.floci.services.neptune.model.NeptuneCluster;
 import io.github.hectorvent.floci.services.neptune.model.NeptuneInstance;
 import io.github.hectorvent.floci.services.neptune.proxy.NeptuneProxyManager;
@@ -35,6 +36,7 @@ public class NeptuneService {
     private final RegionResolver regionResolver;
     private final NeptuneContainerManager containerManager;
     private final NeptuneProxyManager proxyManager;
+    private final NeptuneBulkLoader bulkLoader;
     private final Set<Integer> usedPorts = ConcurrentHashMap.newKeySet();
 
     @Inject
@@ -42,11 +44,13 @@ public class NeptuneService {
                           RegionResolver regionResolver,
                           NeptuneContainerManager containerManager,
                           NeptuneProxyManager proxyManager,
+                          NeptuneBulkLoader bulkLoader,
                           StorageFactory storageFactory) {
         this.config = config;
         this.regionResolver = regionResolver;
         this.containerManager = containerManager;
         this.proxyManager = proxyManager;
+        this.bulkLoader = bulkLoader;
         this.clusters = storageFactory.create("neptune", "neptune-clusters.json",
                 new TypeReference<Map<String, NeptuneCluster>>() {});
         this.instances = storageFactory.create("neptune", "neptune-instances.json",
@@ -89,7 +93,7 @@ public class NeptuneService {
         cluster.setContainerPort(handle.getPort());
         cluster.setProxyPort(proxyPort);
 
-        proxyManager.startProxy(id, proxyPort, handle.getHost(), handle.getPort());
+        proxyManager.startProxy(id, proxyPort, handle.getHost(), handle.getPort(), bulkLoader);
 
         clusters.put(id, cluster);
         LOG.infov("Neptune cluster {0} created, Gremlin endpoint={1}:{2}", id, endpointHost, String.valueOf(proxyPort));
