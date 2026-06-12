@@ -34,6 +34,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -53,7 +54,7 @@ class GlueJobRunnerTest {
 
     @BeforeEach
     void setUp() {
-        runner = new GlueJobRunner(null, null, null, null, null, config(false), null);
+        runner = new GlueJobRunner(null, null, null, null, null, config(false), mock(ContainerDetector.class));
     }
 
     @Test
@@ -75,7 +76,48 @@ class GlueJobRunnerTest {
         assertTrue(command.contains("/home/hadoop/aws-glue-libs/bin/gluesparksubmit"));
         assertTrue(command.contains("/home/glue_user/spark/bin/spark-submit"));
         assertTrue(command.contains("/home/glue_user/aws-glue-libs/bin/gluesparksubmit"));
-        assertTrue(command.contains("exec \"$FLOCI_GLUE_RUNNER\" '/tmp/floci-glue/script.py' '--JOB_NAME' 'orders'"));
+        assertTrue(command.contains("exec \"$FLOCI_GLUE_RUNNER\" "));
+        assertTrue(command.endsWith("'/tmp/floci-glue/script.py' '--JOB_NAME' 'orders'"));
+    }
+
+    @Test
+    void sparkCommandInjectsS3aEndpointConfiguration() {
+        String command = runner.containerCommand(job("5.0", "glueetl"), new JobRun());
+
+        assertTrue(command.contains("--conf 'spark.hadoop.fs.s3a.endpoint=http://host.docker.internal:4566'"));
+        assertTrue(command.contains("--conf 'spark.hadoop.fs.s3a.path.style.access=true'"));
+        assertTrue(command.contains("--conf 'spark.hadoop.fs.s3a.connection.ssl.enabled=false'"));
+        assertTrue(command.contains("--conf 'spark.hadoop.fs.s3a.access.key=test'"));
+        assertTrue(command.contains("--conf 'spark.hadoop.fs.s3a.secret.key=test'"));
+        assertFalse(command.contains("spark.sql.extensions"));
+        assertFalse(command.contains("FLOCI_GLUE_ICEBERG_JARS"));
+    }
+
+    @Test
+    void sparkCommandWithDatalakeFormatsIcebergAddsIcebergConfiguration() {
+        JobRun run = new JobRun();
+        run.setArguments(Map.of("--datalake-formats", "iceberg"));
+
+        String command = runner.containerCommand(job("5.0", "glueetl"), run);
+
+        assertTrue(command.contains(
+                "FLOCI_GLUE_ICEBERG_JARS=$(find /usr/share/aws/datalake-formats/iceberg -name '*.jar'"));
+        assertTrue(command.contains("${FLOCI_GLUE_ICEBERG_JARS:+--jars \"$FLOCI_GLUE_ICEBERG_JARS\"}"));
+        assertTrue(command.contains(
+                "--conf 'spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions'"));
+        assertTrue(command.endsWith("'/tmp/floci-glue/script.py' '--datalake-formats' 'iceberg'"));
+    }
+
+    @Test
+    void pythonShellCommandDoesNotInjectSparkConfiguration() {
+        JobRun run = new JobRun();
+        run.setArguments(Map.of("--datalake-formats", "iceberg"));
+
+        String command = runner.containerCommand(job("5.0", "pythonshell"), run);
+
+        assertFalse(command.contains("--conf"));
+        assertFalse(command.contains("FLOCI_GLUE_ICEBERG_JARS"));
+        assertTrue(command.endsWith("'/tmp/floci-glue/script.py' '--datalake-formats' 'iceberg'"));
     }
 
     @Test
@@ -89,7 +131,7 @@ class GlueJobRunnerTest {
 
     @Test
     void mockModeRunTransitionsToSucceededWithoutDocker() throws Exception {
-        GlueJobRunner mockRunner = new GlueJobRunner(null, null, null, null, null, config(true), null);
+        GlueJobRunner mockRunner = new GlueJobRunner(null, null, null, null, null, config(true), mock(ContainerDetector.class));
         JobRun run = jobRun();
         RecordingConsumer consumer = new RecordingConsumer();
 
@@ -234,7 +276,7 @@ class GlueJobRunnerTest {
     @Test
     void loadScriptMissingS3ObjectThrowsEntityNotFound() {
         S3Service s3Service = mock(S3Service.class);
-        GlueJobRunner s3Runner = new GlueJobRunner(null, null, null, null, s3Service, config(false), null);
+        GlueJobRunner s3Runner = new GlueJobRunner(null, null, null, null, s3Service, config(false), mock(ContainerDetector.class));
         JobCommand command = new JobCommand();
         command.setScriptLocation("s3://scripts/missing.py");
 
@@ -248,7 +290,7 @@ class GlueJobRunnerTest {
     @Test
     void missingScriptFailsJobRunWithErrorMessage() throws Exception {
         S3Service s3Service = mock(S3Service.class);
-        GlueJobRunner s3Runner = new GlueJobRunner(null, null, null, null, s3Service, config(false), null);
+        GlueJobRunner s3Runner = new GlueJobRunner(null, null, null, null, s3Service, config(false), mock(ContainerDetector.class));
         JobRun run = jobRun();
         RecordingConsumer consumer = new RecordingConsumer();
 
@@ -279,12 +321,13 @@ class GlueJobRunnerTest {
 
         String marker = "exec \"$FLOCI_GLUE_RUNNER\" ";
         String quotedArguments = command.substring(command.indexOf(marker) + marker.length());
+        List<String> tokens = shellTokens(quotedArguments);
         assertEquals(List.of("/tmp/floci-glue/script.py",
                         "--quote", "it's",
                         "--spaces", "a b  c",
                         "--dollar", "$HOME",
                         "--semi", "a;b"),
-                shellTokens(quotedArguments));
+                tokens.subList(tokens.indexOf("/tmp/floci-glue/script.py"), tokens.size()));
     }
 
     @Test

@@ -299,11 +299,12 @@ public class GlueJobRunner {
 
     String containerCommand(Job job, JobRun run) {
         String commandName = job.getCommand() != null ? job.getCommand().getName() : null;
-        String runner = commandName != null && commandName.toLowerCase().contains("python")
-                ? pythonRunnerDiscovery()
-                : sparkRunnerDiscovery();
-        return "set -e; " + runner + "; exec \"$FLOCI_GLUE_RUNNER\" "
-                + shellQuote(SCRIPT_PATH) + argumentString(run.getArguments());
+        boolean python = commandName != null && commandName.toLowerCase().contains("python");
+        String runner = python ? pythonRunnerDiscovery() : sparkRunnerDiscovery();
+        String prelude = !python && icebergRequested(run) ? icebergJarsDiscovery() : "";
+        String sparkArguments = python ? "" : sparkSubmitArguments(run);
+        return "set -e; " + runner + "; " + prelude + "exec \"$FLOCI_GLUE_RUNNER\" "
+                + sparkArguments + shellQuote(SCRIPT_PATH) + argumentString(run.getArguments());
     }
 
     private String sparkRunnerDiscovery() {
@@ -326,6 +327,36 @@ public class GlueJobRunner {
                 + "elif command -v python >/dev/null 2>&1; then "
                 + "FLOCI_GLUE_RUNNER=$(command -v python); "
                 + "else echo 'No Python runner found in image' >&2; exit 127; fi";
+    }
+
+    private String sparkSubmitArguments(JobRun run) {
+        StringBuilder sb = new StringBuilder();
+        appendSparkConf(sb, "spark.hadoop.fs.s3a.endpoint", resolveEndpointUrl());
+        appendSparkConf(sb, "spark.hadoop.fs.s3a.path.style.access", "true");
+        appendSparkConf(sb, "spark.hadoop.fs.s3a.connection.ssl.enabled", "false");
+        appendSparkConf(sb, "spark.hadoop.fs.s3a.access.key", "test");
+        appendSparkConf(sb, "spark.hadoop.fs.s3a.secret.key", "test");
+        if (icebergRequested(run)) {
+            sb.append("${FLOCI_GLUE_ICEBERG_JARS:+--jars \"$FLOCI_GLUE_ICEBERG_JARS\"} ");
+            appendSparkConf(sb, "spark.sql.extensions",
+                    "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions");
+        }
+        return sb.toString();
+    }
+
+    private static void appendSparkConf(StringBuilder sb, String key, String value) {
+        sb.append("--conf ").append(shellQuote(key + "=" + value)).append(' ');
+    }
+
+    private static String icebergJarsDiscovery() {
+        return "FLOCI_GLUE_ICEBERG_JARS=$(find /usr/share/aws/datalake-formats/iceberg -name '*.jar' "
+                + "2>/dev/null | paste -sd, -); ";
+    }
+
+    private static boolean icebergRequested(JobRun run) {
+        Map<String, String> arguments = run.getArguments();
+        String formats = arguments != null ? arguments.get("--datalake-formats") : null;
+        return formats != null && formats.toLowerCase().contains("iceberg");
     }
 
     private String argumentString(Map<String, String> arguments) {

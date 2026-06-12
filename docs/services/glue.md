@@ -53,6 +53,8 @@ If a job sets `GlueVersion` to `4.0`, Floci uses the Glue 4 image. If it sets `G
 
 The runner sets standard local AWS environment variables such as `AWS_ENDPOINT_URL`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`, and `AWS_SECRET_ACCESS_KEY`. It uses `python3` or `python` for Python shell commands and otherwise discovers `spark-submit` or `gluesparksubmit` in either the Glue 5 `hadoop` layout or the Glue 4 `glue_user` Spark layout.
 
+For Spark commands, the runner injects `fs.s3a.*` configuration pointing at the local S3 emulator (endpoint, path-style access, dummy credentials), so job scripts can read and write `s3a://` paths without configuring Hadoop settings in the job script. When the job's arguments include `--datalake-formats` containing `iceberg`, the runner additionally enables the Iceberg Spark session extensions and adds any Iceberg runtime jars found under `/usr/share/aws/datalake-formats/iceberg` in the image, mirroring the `--datalake-formats` behavior of managed Glue.
+
 Docker stdout/stderr is forwarded to the local CloudWatch Logs emulator under `/aws-glue/jobs/output`, with streams named `<job-name>/<job-run-id>`. The `JobRun` response also includes `LogGroupName` and `LogStreamName`. `MaxRetries` is honored by starting a fresh one-shot container for each retry attempt and updating the `Attempt` field; unlike real Glue, retries reuse the original job run id instead of creating a separate run per attempt.
 
 `UpdateJob` follows AWS replace semantics: fields omitted from `JobUpdate` are reset to their defaults rather than preserved. `GetJob` echoes the job's `Tags`, which real Glue only returns through `GetTags`.

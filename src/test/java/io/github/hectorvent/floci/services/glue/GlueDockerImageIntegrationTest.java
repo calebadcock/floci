@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.glue;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.services.glue.model.Job;
 import io.github.hectorvent.floci.services.glue.model.JobCommand;
 import io.github.hectorvent.floci.services.glue.model.JobRun;
@@ -103,8 +104,12 @@ class GlueDockerImageIntegrationTest {
                 "mock", false
         ));
         EmulatorConfig.ServicesConfig services = proxy(EmulatorConfig.ServicesConfig.class, Map.of("glue", glue));
-        EmulatorConfig config = proxy(EmulatorConfig.class, Map.of("services", services));
-        return new GlueJobRunner(null, null, null, null, null, config, null);
+        EmulatorConfig config = proxy(EmulatorConfig.class, Map.of(
+                "services", services,
+                "hostname", Optional.empty(),
+                "port", 4566
+        ));
+        return new GlueJobRunner(null, null, null, null, null, config, new ContainerDetector());
     }
 
     private static String defaultImage(String methodName) {
