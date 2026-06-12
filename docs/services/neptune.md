@@ -19,6 +19,8 @@ Floci manages real [Apache TinkerPop Gremlin Server](https://tinkerpop.apache.or
 | `DeleteDBInstance` | Remove an instance from a cluster |
 | `ModifyDBInstance` | Update instance settings |
 
+Each cluster's Gremlin endpoint also serves the Neptune bulk loader HTTP API (`POST /loader`, `GET /loader/{loadId}`) — see [Bulk loader](#bulk-loader-s3--neptune).
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -104,6 +106,26 @@ print(result)
 
 gremlin.close()
 ```
+
+### Bulk loader (S3 → Neptune)
+
+Each cluster's Gremlin endpoint also serves the Neptune bulk loader HTTP API. `POST /loader` reads [Gremlin load data format](https://docs.aws.amazon.com/neptune/latest/userguide/bulk-load-tutorial-format-gremlin.html) CSV files from the emulated S3 service and writes them to the cluster; `GET /loader/{loadId}` reports progress. Vertex files in a load are applied before edge files. Only `format: csv` is supported, and `iamRoleArn` is accepted but ignored.
+
+```bash
+# Upload Gremlin CSV files
+printf '~id,~label,name:String\nc1,customer,Alice\n' | aws s3 cp - s3://graph/vertices.csv
+printf '~id,~from,~to,~label\ne1,c1,c1,KNOWS\n' | aws s3 cp - s3://graph/edges.csv
+
+# Start the load (port from DescribeDBClusters)
+curl -s -X POST http://localhost:8182/loader \
+  -H 'Content-Type: application/json' \
+  -d '{"source": "s3://graph/", "format": "csv"}'
+
+# Check load status
+curl -s http://localhost:8182/loader/<loadId>
+```
+
+Vertices and edges keep the ids from the `~id`, `~from`, and `~to` columns, so loaded data can be queried with `g.V('c1')` just like on Neptune.
 
 ### Management API (Python / boto3)
 

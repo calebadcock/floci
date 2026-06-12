@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.neptune.container;
 
+import com.github.dockerjava.api.DockerClient;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -11,8 +12,12 @@ import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
 import org.jboss.logging.Logger;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.OutputStream;
@@ -37,6 +42,7 @@ public class NeptuneContainerManager {
     private static final int BACKEND_READY_RETRY_MS = 200;
     private static final int BACKEND_PROBE_CONNECT_MS = 2_000;
 
+    private final DockerClient dockerClient;
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
     private final ContainerLogStreamer logStreamer;
@@ -46,12 +52,14 @@ public class NeptuneContainerManager {
     private final Map<String, NeptuneContainerHandle> activeContainers = new ConcurrentHashMap<>();
 
     @Inject
-    public NeptuneContainerManager(ContainerBuilder containerBuilder,
+    public NeptuneContainerManager(DockerClient dockerClient,
+                                   ContainerBuilder containerBuilder,
                                    ContainerLifecycleManager lifecycleManager,
                                    ContainerLogStreamer logStreamer,
                                    ContainerDetector containerDetector,
                                    EmulatorConfig config,
                                    RegionResolver regionResolver) {
+        this.dockerClient = dockerClient;
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
@@ -78,7 +86,15 @@ public class NeptuneContainerManager {
         }
 
         ContainerSpec spec = specBuilder.build();
-        ContainerInfo info = lifecycleManager.createAndStart(spec);
+        String containerId = lifecycleManager.create(spec);
+        ContainerInfo info;
+        try {
+            copyNeptuneIdConfiguration(containerId);
+            info = lifecycleManager.startCreated(containerId, spec);
+        } catch (RuntimeException e) {
+            lifecycleManager.stopAndRemove(containerId, null);
+            throw e;
+        }
         EndpointInfo endpoint = info.getEndpoint(GREMLIN_PORT);
 
         LOG.infov("Neptune Gremlin Server for cluster {0}: {1}", clusterId, endpoint);
@@ -101,6 +117,38 @@ public class NeptuneContainerManager {
         waitForBackendReady(clusterId, endpoint.host(), endpoint.port());
 
         return handle;
+    }
+
+    /**
+     * Replaces the stock TinkerGraph properties with id managers that accept arbitrary ids.
+     * Neptune assigns string ids to vertices and edges, while the Gremlin Server image
+     * defaults to numeric ids and would reject the ids used by Gremlin clients and the
+     * bulk loader.
+     */
+    private void copyNeptuneIdConfiguration(String containerId) {
+        String properties = """
+                gremlin.graph=org.apache.tinkerpop.gremlin.tinkergraph.structure.TinkerGraph
+                gremlin.tinkergraph.vertexIdManager=ANY
+                gremlin.tinkergraph.edgeIdManager=ANY
+                """;
+        try {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            try (TarArchiveOutputStream tar = new TarArchiveOutputStream(out)) {
+                byte[] data = properties.getBytes(StandardCharsets.UTF_8);
+                TarArchiveEntry entry = new TarArchiveEntry("tinkergraph-empty.properties");
+                entry.setSize(data.length);
+                tar.putArchiveEntry(entry);
+                tar.write(data);
+                tar.closeArchiveEntry();
+            }
+            dockerClient.copyArchiveToContainerCmd(containerId)
+                    .withRemotePath("/opt/gremlin-server/conf")
+                    .withTarInputStream(new ByteArrayInputStream(out.toByteArray()))
+                    .exec();
+        } catch (IOException e) {
+            LOG.warnv("Could not apply Neptune id configuration to container {0}: {1}",
+                    containerId, e.getMessage());
+        }
     }
 
     public void stop(NeptuneContainerHandle handle) {
