@@ -34,10 +34,15 @@ Floci supports a focused set of optimized service integrations, plus AWS SDK (`a
 | `arn:aws:states:::aws-sdk:sqs:sendMessage` | AWS SDK variant of SQS `SendMessage` |
 | `arn:aws:states:::states:startExecution`, `.sync`, `.sync:2` | Starts nested state machines |
 | `arn:aws:states:::glue:startJobRun`, `.sync` | Starts local Glue job runs and optionally waits for completion |
+| `arn:aws:states:::athena:*` | Selected Athena optimized integrations |
 
 ### Glue Job Integration
 
 `arn:aws:states:::glue:startJobRun` starts a local Glue job run and returns `{"JobRunId": "..."}` without waiting for the run to finish. With the `.sync` suffix, the execution polls the run until it reaches a terminal state and returns the full `JobRun` on success. The `.sync` wait deadline is derived from the run's `Timeout` (the `Timeout` from the task input, falling back to the job's `Timeout`, default 2880 minutes) plus a short grace period; if the deadline passes, Floci stops the job run and fails the task with `States.Timeout`. Runs that end in any other non-`SUCCEEDED` terminal state fail the task with error name `States.TaskFailed` and the serialized `JobRun` as the cause.
+
+### Athena Integration
+
+`arn:aws:states:::athena:startQueryExecution` submits a local Athena query and returns `{"QueryExecutionId": "..."}` without waiting for it to finish. With the `.sync` suffix, the execution polls the query until it reaches a terminal state and returns `{"QueryExecution": {...}}` on success; queries that end `FAILED` or `CANCELLED` fail the task with error name `States.TaskFailed` and the serialized `QueryExecution` as the cause. The `.sync` wait is capped at 30 minutes (Athena's default DML query timeout); past the cap, Floci stops the query and fails the task with `States.Timeout`. `getQueryExecution`, `getQueryResults`, and `stopQueryExecution` mirror the corresponding Athena actions and use the same request and response shapes.
 
 ## Configuration
 

@@ -3,6 +3,11 @@ package io.github.hectorvent.floci.services.stepfunctions;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
+import io.github.hectorvent.floci.services.athena.AthenaService;
+import io.github.hectorvent.floci.services.athena.model.QueryExecution;
+import io.github.hectorvent.floci.services.athena.model.QueryExecutionContext;
+import io.github.hectorvent.floci.services.athena.model.QueryExecutionState;
+import io.github.hectorvent.floci.services.athena.model.ResultConfiguration;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbJsonHandler;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbService;
 import io.github.hectorvent.floci.services.glue.GlueService;
@@ -45,6 +50,7 @@ public class AslExecutor {
 
     private static final Logger LOG = Logger.getLogger(AslExecutor.class);
     private static final int MAX_WAIT_SECONDS = 30;
+    private static final int ATHENA_SYNC_WAIT_LIMIT_MINUTES = 30;
 
     private static final String QUERY_LANGUAGE_JSONATA = "JSONata";
 
@@ -54,6 +60,7 @@ public class AslExecutor {
     private final DynamoDbJsonHandler dynamoDbJsonHandler;
     private final SqsJsonHandler sqsJsonHandler;
     private final GlueService glueService;
+    private final AthenaService athenaService;
     private final ObjectMapper objectMapper;
     private final JsonataEvaluator jsonataEvaluator;
     private final Instance<StepFunctionsService> sfnService;
@@ -68,6 +75,7 @@ public class AslExecutor {
                        DynamoDbService dynamoDbService, DynamoDbJsonHandler dynamoDbJsonHandler,
                        SqsJsonHandler sqsJsonHandler,
                        GlueService glueService,
+                       AthenaService athenaService,
                        ObjectMapper objectMapper, JsonataEvaluator jsonataEvaluator,
                        Instance<StepFunctionsService> sfnService) {
         this.lambdaExecutor = lambdaExecutor;
@@ -76,6 +84,7 @@ public class AslExecutor {
         this.dynamoDbJsonHandler = dynamoDbJsonHandler;
         this.sqsJsonHandler = sqsJsonHandler;
         this.glueService = glueService;
+        this.athenaService = athenaService;
         this.objectMapper = objectMapper;
         this.jsonataEvaluator = jsonataEvaluator;
         this.sfnService = sfnService;
@@ -87,7 +96,7 @@ public class AslExecutor {
                 ObjectMapper objectMapper, JsonataEvaluator jsonataEvaluator,
                 Instance<StepFunctionsService> sfnService) {
         this(lambdaExecutor, functionStore, dynamoDbService, dynamoDbJsonHandler, sqsJsonHandler,
-                null, objectMapper, jsonataEvaluator, sfnService);
+                null, null, objectMapper, jsonataEvaluator, sfnService);
     }
 
     /**
@@ -379,6 +388,11 @@ public class AslExecutor {
             return invokeGlueStartJobRun(mode, input, region);
         }
 
+        if (resource.startsWith("arn:aws:states:::athena:")) {
+            String operation = resource.substring("arn:aws:states:::athena:".length());
+            return invokeAthena(operation, input);
+        }
+
         // Nested state machine integration
         if (resource.startsWith("arn:aws:states:::states:startExecution")) {
             String mode = resource.substring("arn:aws:states:::states:startExecution".length());
@@ -451,6 +465,86 @@ public class AslExecutor {
         }
         glueService.batchStopJobRun(region, jobName, List.of(run.getId()));
         throw new FailStateException("States.Timeout", "Glue job did not finish before Step Functions wait limit");
+    }
+
+    private JsonNode invokeAthena(String operation, JsonNode input) throws Exception {
+        if (athenaService == null) {
+            throw new FailStateException("Athena.ServiceException", "Athena service is not available");
+        }
+        try {
+            return switch (operation) {
+                case "startQueryExecution", "startQueryExecution.sync" ->
+                        invokeAthenaStartQueryExecution(operation.endsWith(".sync"), input);
+                case "getQueryExecution" -> {
+                    ObjectNode result = objectMapper.createObjectNode();
+                    result.set("QueryExecution",
+                            objectMapper.valueToTree(athenaService.getQueryExecution(queryExecutionId(input))));
+                    yield result;
+                }
+                case "getQueryResults" -> {
+                    ObjectNode result = objectMapper.createObjectNode();
+                    result.set("ResultSet",
+                            objectMapper.valueToTree(athenaService.getQueryResults(queryExecutionId(input))));
+                    yield result;
+                }
+                case "stopQueryExecution" -> {
+                    athenaService.stopQueryExecution(queryExecutionId(input));
+                    yield objectMapper.createObjectNode();
+                }
+                default -> throw new FailStateException("States.TaskFailed",
+                        "Unsupported Athena operation: " + operation);
+            };
+        } catch (AwsException e) {
+            throw new FailStateException("Athena." + e.getErrorCode(), e.getMessage());
+        }
+    }
+
+    private JsonNode invokeAthenaStartQueryExecution(boolean sync, JsonNode input) throws Exception {
+        String query = input.path("QueryString").asText(null);
+        if (query == null || query.isBlank()) {
+            throw new FailStateException("Athena.InvalidRequestException", "QueryString is required");
+        }
+        String workGroup = input.has("WorkGroup") ? input.get("WorkGroup").asText() : "primary";
+        QueryExecutionContext context = input.has("QueryExecutionContext")
+                ? objectMapper.treeToValue(input.get("QueryExecutionContext"), QueryExecutionContext.class)
+                : null;
+        ResultConfiguration resultConfiguration = input.has("ResultConfiguration")
+                ? objectMapper.treeToValue(input.get("ResultConfiguration"), ResultConfiguration.class)
+                : null;
+
+        String id = athenaService.startQueryExecution(query, workGroup, context, resultConfiguration);
+
+        if (!sync) {
+            ObjectNode result = objectMapper.createObjectNode();
+            result.put("QueryExecutionId", id);
+            return result;
+        }
+
+        long deadline = System.currentTimeMillis()
+                + TimeUnit.MINUTES.toMillis(ATHENA_SYNC_WAIT_LIMIT_MINUTES);
+        while (System.currentTimeMillis() < deadline) {
+            QueryExecution current = athenaService.getQueryExecution(id);
+            QueryExecutionState state = current.getStatus() != null ? current.getStatus().getState() : null;
+            if (state == QueryExecutionState.SUCCEEDED) {
+                ObjectNode result = objectMapper.createObjectNode();
+                result.set("QueryExecution", objectMapper.valueToTree(current));
+                return result;
+            }
+            if (state == QueryExecutionState.FAILED || state == QueryExecutionState.CANCELLED) {
+                throw new FailStateException("States.TaskFailed", objectMapper.writeValueAsString(current));
+            }
+            Thread.sleep(100);
+        }
+        athenaService.stopQueryExecution(id);
+        throw new FailStateException("States.Timeout", "Athena query did not finish before Step Functions wait limit");
+    }
+
+    private static String queryExecutionId(JsonNode input) {
+        String id = input.path("QueryExecutionId").asText(null);
+        if (id == null || id.isBlank()) {
+            throw new FailStateException("Athena.InvalidRequestException", "QueryExecutionId is required");
+        }
+        return id;
     }
 
     private JsonNode invokeNestedStateMachine(String mode, JsonNode input, String region) throws Exception {
