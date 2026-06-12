@@ -21,20 +21,23 @@ Floci emulates Amazon Athena with **real SQL execution** powered by a [floci-duc
 ## How it works
 
 1. **Lazy sidecar start**: On the first `StartQueryExecution` call, Floci checks for a local `floci/floci-duck:latest` image and starts the container. Subsequent queries reuse the running container.
-2. **Glue DDL injection**: Floci reads all Glue tables for the target database and generates `CREATE OR REPLACE VIEW` statements mapping each table name to its S3 location via DuckDB's `read_parquet`, `read_json_auto`, or `read_csv_auto` functions — chosen based on the table's `InputFormat` or SerDe serialization library.
+2. **Glue DDL injection**: Floci reads all Glue tables for the target database and generates `CREATE OR REPLACE VIEW` statements mapping each table name to its S3 location via DuckDB's `iceberg_scan`, `read_parquet`, `read_json_auto`, or `read_csv_auto` functions — chosen based on the table's parameters, `InputFormat`, or SerDe serialization library.
 3. **Query execution**: The user's SQL is wrapped in `COPY (...) TO 's3://...' (FORMAT CSV, HEADER)` and executed. Results are written directly to the output S3 path.
 4. **Results retrieval**: `GetQueryResults` reads the CSV back from S3 and returns it in the standard Athena `ResultSet` shape.
 
 ## Format inference
 
-The DuckDB read function is chosen from the Glue table's `StorageDescriptor`:
+The DuckDB read function is chosen from the Glue table's parameters and `StorageDescriptor`:
 
 | Condition | Read function |
 |---|---|
+| Table parameter `table_type` is `ICEBERG` | `iceberg_scan` |
 | `InputFormat` or `SerializationLibrary` contains `parquet` | `read_parquet` |
 | `InputFormat` or `SerializationLibrary` contains `json` | `read_json_auto` |
 | `InputFormat` contains `hive` | `read_json_auto` |
 | Anything else | `read_csv_auto` |
+
+Iceberg tables are read through the DuckDB `iceberg` extension (loaded on demand), scanning the table's `metadata_location` parameter. Iceberg tables without a `metadata_location` are skipped so that an unbindable view cannot break other tables' queries.
 
 ## Configuration
 

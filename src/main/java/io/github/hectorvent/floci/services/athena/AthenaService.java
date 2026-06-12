@@ -215,30 +215,52 @@ public class AthenaService {
 
     // ── private helpers ───────────────────────────────────────────────────────
 
-    private String buildGlueDdl(String database) {
+    String buildGlueDdl(String database) {
         StringBuilder sb = new StringBuilder();
+        boolean icebergUsed = false;
         try {
             List<Table> tables = glueService.getTables(database);
             for (Table table : tables) {
                 String location = table.getStorageDescriptor() != null
                         ? table.getStorageDescriptor().getLocation()
                         : null;
-                if (location == null || location.isBlank()) {
-                    continue;
+                String expression;
+                if (isIcebergTable(table)) {
+                    String metadataLocation = table.getParameters().get("metadata_location");
+                    if (metadataLocation == null || metadataLocation.isBlank()) {
+                        // Without metadata_location iceberg_scan cannot bind, and a failing
+                        // view would break every query in the database
+                        continue;
+                    }
+                    expression = "iceberg_scan('" + metadataLocation + "', allow_moved_paths = true)";
+                    icebergUsed = true;
+                } else {
+                    if (location == null || location.isBlank()) {
+                        continue;
+                    }
+                    String readFn = inferReadFunction(table);
+                    String normalizedLocation = location.endsWith("/")
+                            ? location.substring(0, location.length() - 1) : location;
+                    expression = readExpression(readFn, normalizedLocation);
                 }
-                String readFn = inferReadFunction(table);
-                String normalizedLocation = location.endsWith("/")
-                        ? location.substring(0, location.length() - 1) : location;
                 sb.append("CREATE OR REPLACE VIEW \"")
                   .append(table.getName())
                   .append("\" AS SELECT * FROM ")
-                  .append(readExpression(readFn, normalizedLocation))
+                  .append(expression)
                   .append(";\n");
             }
         } catch (Exception e) {
             LOG.debugv("Could not inject Glue DDL for database {0}: {1}", database, e.getMessage());
         }
+        if (icebergUsed) {
+            sb.insert(0, "INSTALL iceberg; LOAD iceberg;\n");
+        }
         return sb.toString();
+    }
+
+    private static boolean isIcebergTable(Table table) {
+        return table.getParameters() != null
+                && "ICEBERG".equalsIgnoreCase(table.getParameters().get("table_type"));
     }
 
     private String readExpression(String readFn, String normalizedLocation) {

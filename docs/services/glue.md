@@ -39,10 +39,11 @@ The Glue Data Catalog is automatically used by **Athena** to resolve table names
 
 Tables can reference a Schema Registry schema version through `StorageDescriptor.SchemaReference`. On `GetTable` and `GetTables`, Floci resolves the schema definition into Glue columns when possible.
 
-The DuckDB read function is selected based on the table's `StorageDescriptor.InputFormat` and `StorageDescriptor.SerdeInfo.SerializationLibrary`:
+The DuckDB read function is selected based on the table's parameters, `StorageDescriptor.InputFormat`, and `StorageDescriptor.SerdeInfo.SerializationLibrary`:
 
 | Condition | DuckDB function |
 |---|---|
+| Table parameter `table_type` is `ICEBERG` | `iceberg_scan` |
 | `InputFormat` or `SerializationLibrary` contains `parquet` | `read_parquet` |
 | `InputFormat` or `SerializationLibrary` contains `json` | `read_json_auto` |
 | `InputFormat` contains `hive` | `read_json_auto` |
