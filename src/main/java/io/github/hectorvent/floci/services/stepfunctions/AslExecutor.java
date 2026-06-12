@@ -5,6 +5,8 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbJsonHandler;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbService;
+import io.github.hectorvent.floci.services.glue.GlueService;
+import io.github.hectorvent.floci.services.glue.model.JobRun;
 import io.github.hectorvent.floci.services.lambda.LambdaExecutorService;
 import io.github.hectorvent.floci.services.lambda.LambdaFunctionStore;
 import io.github.hectorvent.floci.services.lambda.model.InvocationType;
@@ -51,6 +53,7 @@ public class AslExecutor {
     private final DynamoDbService dynamoDbService;
     private final DynamoDbJsonHandler dynamoDbJsonHandler;
     private final SqsJsonHandler sqsJsonHandler;
+    private final GlueService glueService;
     private final ObjectMapper objectMapper;
     private final JsonataEvaluator jsonataEvaluator;
     private final Instance<StepFunctionsService> sfnService;
@@ -64,6 +67,7 @@ public class AslExecutor {
     public AslExecutor(LambdaExecutorService lambdaExecutor, LambdaFunctionStore functionStore,
                        DynamoDbService dynamoDbService, DynamoDbJsonHandler dynamoDbJsonHandler,
                        SqsJsonHandler sqsJsonHandler,
+                       GlueService glueService,
                        ObjectMapper objectMapper, JsonataEvaluator jsonataEvaluator,
                        Instance<StepFunctionsService> sfnService) {
         this.lambdaExecutor = lambdaExecutor;
@@ -71,9 +75,19 @@ public class AslExecutor {
         this.dynamoDbService = dynamoDbService;
         this.dynamoDbJsonHandler = dynamoDbJsonHandler;
         this.sqsJsonHandler = sqsJsonHandler;
+        this.glueService = glueService;
         this.objectMapper = objectMapper;
         this.jsonataEvaluator = jsonataEvaluator;
         this.sfnService = sfnService;
+    }
+
+    AslExecutor(LambdaExecutorService lambdaExecutor, LambdaFunctionStore functionStore,
+                DynamoDbService dynamoDbService, DynamoDbJsonHandler dynamoDbJsonHandler,
+                SqsJsonHandler sqsJsonHandler,
+                ObjectMapper objectMapper, JsonataEvaluator jsonataEvaluator,
+                Instance<StepFunctionsService> sfnService) {
+        this(lambdaExecutor, functionStore, dynamoDbService, dynamoDbJsonHandler, sqsJsonHandler,
+                null, objectMapper, jsonataEvaluator, sfnService);
     }
 
     /**
@@ -359,6 +373,12 @@ public class AslExecutor {
             return invokeAwsSdkSqsSendMessage(input, region);
         }
 
+        if (resource.startsWith("arn:aws:states:::glue:startJobRun")) {
+            String mode = resource.substring("arn:aws:states:::glue:startJobRun".length());
+            String region = extractRegionFromArn(sm.getStateMachineArn());
+            return invokeGlueStartJobRun(mode, input, region);
+        }
+
         // Nested state machine integration
         if (resource.startsWith("arn:aws:states:::states:startExecution")) {
             String mode = resource.substring("arn:aws:states:::states:startExecution".length());
@@ -379,6 +399,58 @@ public class AslExecutor {
 
         throw new FailStateException("States.TaskFailed",
                 "Unsupported resource: " + resource);
+    }
+
+    private JsonNode invokeGlueStartJobRun(String mode, JsonNode input, String region) throws Exception {
+        if (glueService == null) {
+            throw new FailStateException("Glue.ServiceException", "Glue service is not available");
+        }
+        String jobName = input.path("JobName").asText(null);
+        if (jobName == null || jobName.isBlank()) {
+            throw new FailStateException("Glue.InvalidInputException", "JobName is required");
+        }
+        Map<String, String> arguments = null;
+        if (input.has("Arguments") && input.get("Arguments").isObject()) {
+            arguments = objectMapper.convertValue(input.get("Arguments"),
+                    new com.fasterxml.jackson.core.type.TypeReference<Map<String, String>>() {});
+        }
+        Integer timeout = input.has("Timeout") ? input.get("Timeout").asInt() : null;
+        String workerType = input.path("WorkerType").asText(null);
+        Integer numberOfWorkers = input.has("NumberOfWorkers") ? input.get("NumberOfWorkers").asInt() : null;
+
+        JobRun run;
+        try {
+            run = glueService.startJobRun(region, jobName, arguments, timeout, workerType, numberOfWorkers);
+        } catch (AwsException e) {
+            throw new FailStateException("Glue." + e.getErrorCode(), e.getMessage());
+        }
+
+        if ("".equals(mode)) {
+            ObjectNode result = objectMapper.createObjectNode();
+            result.put("JobRunId", run.getId());
+            return result;
+        }
+        if (!".sync".equals(mode)) {
+            throw new FailStateException("States.TaskFailed", "Unsupported Glue integration mode: " + mode);
+        }
+
+        int timeoutMinutes = run.getTimeout() != null ? run.getTimeout() : GlueService.DEFAULT_JOB_TIMEOUT_MINUTES;
+        long deadline = System.currentTimeMillis()
+                + TimeUnit.MINUTES.toMillis(timeoutMinutes) + TimeUnit.SECONDS.toMillis(30);
+        while (System.currentTimeMillis() < deadline) {
+            Thread.sleep(250);
+            JobRun current = glueService.getJobRun(region, jobName, run.getId());
+            String state = current.getJobRunState();
+            if (!GlueService.isTerminalJobRunState(state)) {
+                continue;
+            }
+            if ("SUCCEEDED".equals(state)) {
+                return objectMapper.valueToTree(current);
+            }
+            throw new FailStateException("States.TaskFailed", objectMapper.writeValueAsString(current));
+        }
+        glueService.batchStopJobRun(region, jobName, List.of(run.getId()));
+        throw new FailStateException("States.Timeout", "Glue job did not finish before Step Functions wait limit");
     }
 
     private JsonNode invokeNestedStateMachine(String mode, JsonNode input, String region) throws Exception {

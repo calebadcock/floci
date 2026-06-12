@@ -225,6 +225,11 @@ floci:
       default-image: "floci/floci-duck:latest"
     glue:
       enabled: true
+      mock: false
+      default-job-image: "public.ecr.aws/glue/aws-glue-libs:5"
+      glue4-job-image: "public.ecr.aws/glue/aws-glue-libs:glue_libs_4.0.0_image_01"
+      glue5-job-image: "public.ecr.aws/glue/aws-glue-libs:5"
+      # docker-network: optional override for Glue job containers
     ses:
       enabled: true
       # smtp-host: mailpit          # SMTP server for email relay (empty = store only)

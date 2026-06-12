@@ -139,6 +139,7 @@ floci:
       mock: true
     glue:
       enabled: true
+      mock: true
     ses:
       enabled: true
     opensearch:

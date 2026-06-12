@@ -667,6 +667,20 @@ public interface EmulatorConfig {
     interface GlueServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        @WithDefault("false")
+        boolean mock();
+
+        @WithDefault("public.ecr.aws/glue/aws-glue-libs:5")
+        String defaultJobImage();
+
+        @WithDefault("public.ecr.aws/glue/aws-glue-libs:glue_libs_4.0.0_image_01")
+        String glue4JobImage();
+
+        @WithDefault("public.ecr.aws/glue/aws-glue-libs:5")
+        String glue5JobImage();
+
+        Optional<String> dockerNetwork();
     }
 
     interface SesServiceConfig {

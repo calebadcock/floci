@@ -4,10 +4,13 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.glue.model.Column;
 import io.github.hectorvent.floci.services.glue.model.Database;
+import io.github.hectorvent.floci.services.glue.model.Job;
+import io.github.hectorvent.floci.services.glue.model.JobRun;
 import io.github.hectorvent.floci.services.glue.model.Partition;
 import io.github.hectorvent.floci.services.glue.model.SchemaReference;
 import io.github.hectorvent.floci.services.glue.model.StorageDescriptor;
@@ -17,6 +20,7 @@ import io.github.hectorvent.floci.services.glue.schemaregistry.GlueSchemaRegistr
 import io.github.hectorvent.floci.services.glue.schemaregistry.SchemaToColumnsConverter;
 import io.github.hectorvent.floci.services.glue.schemaregistry.model.SchemaId;
 import io.github.hectorvent.floci.services.glue.schemaregistry.model.SchemaVersion;
+import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -29,6 +33,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
@@ -38,24 +43,32 @@ public class GlueService {
     private static final Logger LOG = Logger.getLogger(GlueService.class);
     private static final int MAX_FUNCTION_PATTERN_LENGTH = 255;
     private static final int MAX_FUNCTION_RESULTS = 100;
+    public static final int DEFAULT_JOB_TIMEOUT_MINUTES = 2880;
 
     private final StorageBackend<String, Database> databaseStore;
     private final StorageBackend<String, Table> tableStore;
     private final StorageBackend<String, Partition> partitionStore;
     private final StorageBackend<String, UserDefinedFunction> functionStore;
+    private final StorageBackend<String, Job> jobStore;
+    private final StorageBackend<String, JobRun> jobRunStore;
     private final GlueSchemaRegistryService schemaRegistryService;
     private final RegionResolver regionResolver;
+    private final GlueJobRunner jobRunner;
 
     @Inject
     public GlueService(StorageFactory storageFactory,
                        GlueSchemaRegistryService schemaRegistryService,
-                       RegionResolver regionResolver) {
+                       RegionResolver regionResolver,
+                       GlueJobRunner jobRunner) {
         this.databaseStore = storageFactory.create("glue", "databases.json", new TypeReference<>() {});
         this.tableStore = storageFactory.create("glue", "tables.json", new TypeReference<>() {});
         this.partitionStore = storageFactory.create("glue", "partitions.json", new TypeReference<>() {});
         this.functionStore = storageFactory.create("glue", "functions.json", new TypeReference<>() {});
+        this.jobStore = storageFactory.create("glue", "jobs.json", new TypeReference<>() {});
+        this.jobRunStore = storageFactory.create("glue", "job_runs.json", new TypeReference<>() {});
         this.schemaRegistryService = schemaRegistryService;
         this.regionResolver = regionResolver;
+        this.jobRunner = jobRunner;
     }
 
     GlueService(StorageBackend<String, Database> databaseStore,
@@ -64,12 +77,28 @@ public class GlueService {
                 StorageBackend<String, UserDefinedFunction> functionStore,
                 GlueSchemaRegistryService schemaRegistryService,
                 RegionResolver regionResolver) {
+        this(databaseStore, tableStore, partitionStore, functionStore,
+                new InMemoryStorage<>(), new InMemoryStorage<>(), schemaRegistryService, regionResolver, null);
+    }
+
+    GlueService(StorageBackend<String, Database> databaseStore,
+                StorageBackend<String, Table> tableStore,
+                StorageBackend<String, Partition> partitionStore,
+                StorageBackend<String, UserDefinedFunction> functionStore,
+                StorageBackend<String, Job> jobStore,
+                StorageBackend<String, JobRun> jobRunStore,
+                GlueSchemaRegistryService schemaRegistryService,
+                RegionResolver regionResolver,
+                GlueJobRunner jobRunner) {
         this.databaseStore = databaseStore;
         this.tableStore = tableStore;
         this.partitionStore = partitionStore;
         this.functionStore = functionStore;
+        this.jobStore = jobStore;
+        this.jobRunStore = jobRunStore;
         this.schemaRegistryService = schemaRegistryService;
         this.regionResolver = regionResolver;
+        this.jobRunner = jobRunner;
     }
 
     public void createDatabase(Database database) {
@@ -270,6 +299,167 @@ public class GlueService {
         functionStore.delete(functionKey(databaseName, functionName));
     }
 
+    public String createJob(String region, Job job) {
+        validateJob(job);
+        String key = jobKey(region, job.getName());
+        if (jobStore.get(key).isPresent()) {
+            throw new AwsException("AlreadyExistsException", "Job already exists: " + job.getName(), 400);
+        }
+        Instant now = Instant.now();
+        job.setCreatedOn(now);
+        job.setLastModifiedOn(now);
+        if (job.getMaxRetries() == null) {
+            job.setMaxRetries(0);
+        }
+        if (job.getTimeout() == null) {
+            job.setTimeout(DEFAULT_JOB_TIMEOUT_MINUTES);
+        }
+        jobStore.put(key, job);
+        LOG.infov("Created Glue Job: {0}", job.getName());
+        return job.getName();
+    }
+
+    public Job getJob(String region, String name) {
+        return jobStore.get(jobKey(region, name))
+                .orElseThrow(() -> new AwsException("EntityNotFoundException", "Job not found: " + name, 400));
+    }
+
+    public List<Job> getJobs(String region) {
+        String prefix = normalizeRegion(region) + ":";
+        return jobStore.scan(k -> k.startsWith(prefix)).stream()
+                .sorted(Comparator.comparing(Job::getName, Comparator.nullsFirst(String::compareTo)))
+                .toList();
+    }
+
+    public void updateJob(String region, String jobName, Job update) {
+        Job existing = getJob(region, jobName);
+        if (update == null) {
+            update = new Job();
+        }
+        if (update.getName() != null && !existing.getName().equals(update.getName())) {
+            throw new AwsException("InvalidInputException", "Job name cannot be changed", 400);
+        }
+        Job merged = mergeJobUpdate(existing, update);
+        validateJob(merged);
+        merged.setLastModifiedOn(Instant.now());
+        jobStore.put(jobKey(region, jobName), merged);
+    }
+
+    public void deleteJob(String region, String name) {
+        getJob(region, name);
+        jobStore.delete(jobKey(region, name));
+        LOG.infov("Deleted Glue Job: {0}", name);
+    }
+
+    public JobRun startJobRun(String region, String jobName, Map<String, String> arguments,
+                              Integer timeout, String workerType, Integer numberOfWorkers) {
+        Job job = getJob(region, jobName);
+        enforceMaxConcurrentRuns(region, job);
+        String runId = "jr_" + UUID.randomUUID().toString().replace("-", "");
+        Instant now = Instant.now();
+        JobRun run = new JobRun();
+        run.setId(runId);
+        run.setAttempt(0);
+        run.setJobName(job.getName());
+        run.setJobRunState("STARTING");
+        run.setArguments(mergedArguments(job, arguments));
+        run.setStartedOn(now);
+        run.setLastModifiedOn(now);
+        run.setTimeout(timeout != null ? timeout : job.getTimeout());
+        run.setGlueVersion(job.getGlueVersion());
+        run.setWorkerType(workerType != null ? workerType : job.getWorkerType());
+        run.setNumberOfWorkers(numberOfWorkers != null ? numberOfWorkers : job.getNumberOfWorkers());
+        jobRunStore.put(jobRunKey(region, job.getName(), runId), run);
+
+        if (jobRunner != null) {
+            jobRunner.startJobRun(region, job, run, updated -> persistJobRun(region, updated));
+        }
+        return run;
+    }
+
+    public JobRun getJobRun(String region, String jobName, String runId) {
+        getJob(region, jobName);
+        return jobRunStore.get(jobRunKey(region, jobName, runId))
+                .orElseThrow(() -> new AwsException("EntityNotFoundException",
+                        "Job run not found: " + jobName + "/" + runId, 400));
+    }
+
+    public List<JobRun> getJobRuns(String region, String jobName) {
+        getJob(region, jobName);
+        return scanJobRuns(region, jobName).stream()
+                .sorted(Comparator.comparing(JobRun::getStartedOn, Comparator.nullsLast(Comparator.reverseOrder())))
+                .toList();
+    }
+
+    public BatchStopJobRunResult batchStopJobRun(String region, String jobName, List<String> runIds) {
+        getJob(region, jobName);
+        List<BatchStopJobRunSuccessfulSubmission> successful = new ArrayList<>();
+        List<BatchStopJobRunError> errors = new ArrayList<>();
+        for (String runId : runIds) {
+            JobRun run;
+            try {
+                run = getJobRun(region, jobName, runId);
+            } catch (AwsException e) {
+                errors.add(new BatchStopJobRunError(jobName, runId,
+                        new ErrorDetail(e.getErrorCode(), e.getMessage())));
+                continue;
+            }
+            if (!isTerminalJobRunState(run.getJobRunState())) {
+                if (jobRunner != null) {
+                    jobRunner.stopJobRun(runId);
+                }
+                Instant now = Instant.now();
+                run.setJobRunState("STOPPED");
+                run.setLastModifiedOn(now);
+                run.setCompletedOn(now);
+                run.setStateDetail("Stopped by BatchStopJobRun");
+                persistJobRun(region, run);
+                successful.add(new BatchStopJobRunSuccessfulSubmission(jobName, runId));
+            } else {
+                errors.add(new BatchStopJobRunError(jobName, runId,
+                        new ErrorDetail("InvalidInputException",
+                                "Job run is already terminal: " + run.getJobRunState())));
+            }
+        }
+        return new BatchStopJobRunResult(successful, errors);
+    }
+
+    void persistJobRun(String region, JobRun run) {
+        jobRunStore.put(jobRunKey(region, run.getJobName(), run.getId()), run);
+    }
+
+    private List<JobRun> scanJobRuns(String region, String jobName) {
+        String prefix = jobRunPrefix(region, jobName);
+        return jobRunStore.scan(k -> k.startsWith(prefix)).stream()
+                .filter(run -> jobName.equals(run.getJobName()))
+                .toList();
+    }
+
+    private void enforceMaxConcurrentRuns(String region, Job job) {
+        int maxConcurrentRuns = maxConcurrentRuns(job);
+        long activeRuns = scanJobRuns(region, job.getName()).stream()
+                .filter(run -> !isTerminalJobRunState(run.getJobRunState()))
+                .count();
+        if (activeRuns >= maxConcurrentRuns) {
+            throw new AwsException("ConcurrentRunsExceededException",
+                    "Concurrent runs exceeded for job: " + job.getName(), 400);
+        }
+    }
+
+    private static int maxConcurrentRuns(Job job) {
+        Map<String, Object> executionProperty = job.getExecutionProperty();
+        Object value = executionProperty != null ? executionProperty.get("MaxConcurrentRuns") : null;
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        return 1;
+    }
+
+    public static boolean isTerminalJobRunState(String state) {
+        return "SUCCEEDED".equals(state) || "FAILED".equals(state)
+                || "STOPPED".equals(state) || "TIMEOUT".equals(state);
+    }
+
     private void validateSchemaReference(Table table) {
         SchemaReference ref = schemaReferenceOf(table);
         if (ref == null) {
@@ -312,6 +502,55 @@ public class GlueService {
         return sd != null ? sd.getSchemaReference() : null;
     }
 
+    private void validateJob(Job job) {
+        if (job == null) {
+            throw new AwsException("InvalidInputException", "Job input is required", 400);
+        }
+        if (job.getName() == null || job.getName().isBlank()) {
+            throw new AwsException("InvalidInputException", "Name is required", 400);
+        }
+        if (job.getRole() == null || job.getRole().isBlank()) {
+            throw new AwsException("InvalidInputException", "Role is required", 400);
+        }
+        if (job.getCommand() == null || job.getCommand().getScriptLocation() == null
+                || job.getCommand().getScriptLocation().isBlank()) {
+            throw new AwsException("InvalidInputException", "Command.ScriptLocation is required", 400);
+        }
+    }
+
+    private Map<String, String> mergedArguments(Job job, Map<String, String> runArguments) {
+        Map<String, String> merged = new LinkedHashMap<>();
+        if (job.getDefaultArguments() != null) {
+            merged.putAll(job.getDefaultArguments());
+        }
+        if (runArguments != null) {
+            merged.putAll(runArguments);
+        }
+        if (job.getNonOverridableArguments() != null) {
+            merged.putAll(job.getNonOverridableArguments());
+        }
+        return merged;
+    }
+
+    private Job mergeJobUpdate(Job existing, Job update) {
+        Job merged = new Job();
+        merged.setName(existing.getName());
+        merged.setCreatedOn(existing.getCreatedOn());
+        merged.setDescription(update.getDescription());
+        merged.setRole(update.getRole());
+        merged.setExecutionProperty(update.getExecutionProperty());
+        merged.setCommand(update.getCommand());
+        merged.setDefaultArguments(update.getDefaultArguments());
+        merged.setNonOverridableArguments(update.getNonOverridableArguments());
+        merged.setMaxRetries(update.getMaxRetries() != null ? update.getMaxRetries() : 0);
+        merged.setTimeout(update.getTimeout() != null ? update.getTimeout() : DEFAULT_JOB_TIMEOUT_MINUTES);
+        merged.setGlueVersion(update.getGlueVersion());
+        merged.setWorkerType(update.getWorkerType());
+        merged.setNumberOfWorkers(update.getNumberOfWorkers());
+        merged.setTags(update.getTags());
+        return merged;
+    }
+
     private static String functionKey(String databaseName, String functionName) {
         return normalizeName(databaseName) + ":" + normalizeName(functionName);
     }
@@ -320,8 +559,24 @@ public class GlueService {
         return normalizeName(databaseName) + ":" + normalizeName(tableName);
     }
 
+    private static String jobKey(String region, String jobName) {
+        return normalizeRegion(region) + ":" + jobName;
+    }
+
+    private static String jobRunPrefix(String region, String jobName) {
+        return normalizeRegion(region) + ":" + jobName + ":";
+    }
+
+    private static String jobRunKey(String region, String jobName, String runId) {
+        return jobRunPrefix(region, jobName) + runId;
+    }
+
     private static String normalizeName(String name) {
         return name.toLowerCase(Locale.ROOT);
+    }
+
+    private static String normalizeRegion(String region) {
+        return region == null || region.isBlank() ? "us-east-1" : region;
     }
 
     private static Pattern compileFunctionPattern(String pattern) {
@@ -357,10 +612,28 @@ public class GlueService {
 
     public record UserDefinedFunctionPage(List<UserDefinedFunction> functions, String nextToken) {}
 
+    @RegisterForReflection
     public record BatchDeleteTableError(
             @JsonProperty("TableName") String tableName,
             @JsonProperty("ErrorDetail") ErrorDetail errorDetail) {}
 
+    @RegisterForReflection
+    public record BatchStopJobRunResult(
+            @JsonProperty("SuccessfulSubmissions") List<BatchStopJobRunSuccessfulSubmission> successfulSubmissions,
+            @JsonProperty("Errors") List<BatchStopJobRunError> errors) {}
+
+    @RegisterForReflection
+    public record BatchStopJobRunSuccessfulSubmission(
+            @JsonProperty("JobName") String jobName,
+            @JsonProperty("JobRunId") String jobRunId) {}
+
+    @RegisterForReflection
+    public record BatchStopJobRunError(
+            @JsonProperty("JobName") String jobName,
+            @JsonProperty("JobRunId") String jobRunId,
+            @JsonProperty("ErrorDetail") ErrorDetail errorDetail) {}
+
+    @RegisterForReflection
     public record ErrorDetail(
             @JsonProperty("ErrorCode") String errorCode,
             @JsonProperty("ErrorMessage") String errorMessage) {}

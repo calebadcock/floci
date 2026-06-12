@@ -21,6 +21,24 @@
 | `SendTaskFailure` | Report task failure |
 | `SendTaskHeartbeat` | Send a heartbeat for long-running tasks |
 
+## Service Integrations
+
+Floci supports a focused set of optimized service integrations, plus AWS SDK (`aws-sdk:`) variants for DynamoDB and SQS:
+
+| Resource | Notes |
+|---|---|
+| `arn:aws:states:::lambda:invoke` | Invokes local Lambda functions |
+| `arn:aws:states:::dynamodb:*` | Selected DynamoDB optimized integrations |
+| `arn:aws:states:::aws-sdk:dynamodb:*` | AWS SDK DynamoDB integrations (camelCase action names) |
+| `arn:aws:states:::sqs:sendMessage` | Sends a message to local SQS |
+| `arn:aws:states:::aws-sdk:sqs:sendMessage` | AWS SDK variant of SQS `SendMessage` |
+| `arn:aws:states:::states:startExecution`, `.sync`, `.sync:2` | Starts nested state machines |
+| `arn:aws:states:::glue:startJobRun`, `.sync` | Starts local Glue job runs and optionally waits for completion |
+
+### Glue Job Integration
+
+`arn:aws:states:::glue:startJobRun` starts a local Glue job run and returns `{"JobRunId": "..."}` without waiting for the run to finish. With the `.sync` suffix, the execution polls the run until it reaches a terminal state and returns the full `JobRun` on success. The `.sync` wait deadline is derived from the run's `Timeout` (the `Timeout` from the task input, falling back to the job's `Timeout`, default 2880 minutes) plus a short grace period; if the deadline passes, Floci stops the job run and fails the task with `States.Timeout`. Runs that end in any other non-`SUCCEEDED` terminal state fail the task with error name `States.TaskFailed` and the serialized `JobRun` as the cause.
+
 ## Configuration
 
 | Variable | Default | Description |

@@ -8,6 +8,9 @@ import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.glue.model.Column;
 import io.github.hectorvent.floci.services.glue.model.Database;
+import io.github.hectorvent.floci.services.glue.model.Job;
+import io.github.hectorvent.floci.services.glue.model.JobCommand;
+import io.github.hectorvent.floci.services.glue.model.JobRun;
 import io.github.hectorvent.floci.services.glue.model.Partition;
 import io.github.hectorvent.floci.services.glue.model.SchemaReference;
 import io.github.hectorvent.floci.services.glue.model.StorageDescriptor;
@@ -607,6 +610,225 @@ class GlueServiceTest {
         assertEquals("InvalidInputException", ex.getErrorCode());
     }
 
+    @Test
+    void glueJobLifecycleStoresJobAndStartsRun() {
+        Job job = job("local-etl", "s3://scripts/jobs/local_etl.py");
+        job.setDefaultArguments(Map.of("--source", "default", "--mode", "full"));
+        job.setNonOverridableArguments(Map.of("--mode", "forced"));
+
+        String name = glueService.createJob(REGION, job);
+        Job fetched = glueService.getJob(REGION, name);
+        JobRun run = glueService.startJobRun(REGION, name, Map.of("--source", "override"), 10, "G.1X", 2);
+
+        assertEquals("local-etl", name);
+        assertNotNull(fetched.getCreatedOn());
+        assertEquals("s3://scripts/jobs/local_etl.py", fetched.getCommand().getScriptLocation());
+        assertEquals("STARTING", run.getJobRunState());
+        assertEquals("override", run.getArguments().get("--source"));
+        assertEquals("forced", run.getArguments().get("--mode"));
+        assertEquals("G.1X", run.getWorkerType());
+        assertEquals(2, run.getNumberOfWorkers());
+        assertEquals(run.getId(), glueService.getJobRun(REGION, name, run.getId()).getId());
+    }
+
+    @Test
+    void createGlueJobRequiresScriptLocation() {
+        Job job = job("broken", null);
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> glueService.createJob(REGION, job));
+
+        assertEquals("InvalidInputException", ex.getErrorCode());
+    }
+
+    @Test
+    void batchStopJobRunReportsSuccessesAndErrors() {
+        String jobName = glueService.createJob(REGION, job("stoppable", "s3://scripts/job.py"));
+        JobRun run = glueService.startJobRun(REGION, jobName, null, null, null, null);
+
+        GlueService.BatchStopJobRunResult result =
+                glueService.batchStopJobRun(REGION, jobName, List.of(run.getId(), "missing"));
+
+        assertEquals(1, result.successfulSubmissions().size());
+        assertEquals(run.getId(), result.successfulSubmissions().getFirst().jobRunId());
+        assertEquals(1, result.errors().size());
+        assertEquals(jobName, result.errors().getFirst().jobName());
+        assertEquals("missing", result.errors().getFirst().jobRunId());
+        assertEquals("EntityNotFoundException", result.errors().getFirst().errorDetail().errorCode());
+        JobRun stopped = glueService.getJobRun(REGION, jobName, run.getId());
+        assertEquals("STOPPED", stopped.getJobRunState());
+        assertEquals("Stopped by BatchStopJobRun", stopped.getStateDetail());
+    }
+
+    @Test
+    void batchStopJobRunReportsAlreadyTerminalRunsAsErrors() {
+        String jobName = glueService.createJob(REGION, job("terminal", "s3://scripts/job.py"));
+        JobRun run = glueService.startJobRun(REGION, jobName, null, null, null, null);
+        glueService.batchStopJobRun(REGION, jobName, List.of(run.getId()));
+
+        GlueService.BatchStopJobRunResult result =
+                glueService.batchStopJobRun(REGION, jobName, List.of(run.getId()));
+
+        assertTrue(result.successfulSubmissions().isEmpty());
+        assertEquals(1, result.errors().size());
+        assertEquals(jobName, result.errors().getFirst().jobName());
+        assertEquals(run.getId(), result.errors().getFirst().jobRunId());
+        assertEquals("InvalidInputException", result.errors().getFirst().errorDetail().errorCode());
+        assertEquals("Job run is already terminal: STOPPED",
+                result.errors().getFirst().errorDetail().errorMessage());
+    }
+
+    @Test
+    void createJobRejectsDuplicateName() {
+        glueService.createJob(REGION, job("dup", "s3://scripts/job.py"));
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> glueService.createJob(REGION, job("dup", "s3://scripts/job.py")));
+
+        assertEquals("AlreadyExistsException", ex.getErrorCode());
+    }
+
+    @Test
+    void deleteJobRemovesJobAndThrowsForMissingJob() {
+        glueService.createJob(REGION, job("doomed", "s3://scripts/job.py"));
+
+        glueService.deleteJob(REGION, "doomed");
+
+        AwsException getEx = assertThrows(AwsException.class,
+                () -> glueService.getJob(REGION, "doomed"));
+        assertEquals("EntityNotFoundException", getEx.getErrorCode());
+        AwsException deleteEx = assertThrows(AwsException.class,
+                () -> glueService.deleteJob(REGION, "doomed"));
+        assertEquals("EntityNotFoundException", deleteEx.getErrorCode());
+    }
+
+    @Test
+    void getJobsReturnsJobsForRegionSortedByName() {
+        glueService.createJob(REGION, job("b-job", "s3://scripts/b.py"));
+        glueService.createJob(REGION, job("a-job", "s3://scripts/a.py"));
+        glueService.createJob("eu-west-1", job("other-region", "s3://scripts/o.py"));
+
+        List<Job> jobs = glueService.getJobs(REGION);
+
+        assertEquals(List.of("a-job", "b-job"), jobs.stream().map(Job::getName).toList());
+        assertEquals(List.of("other-region"), glueService.getJobs("eu-west-1").stream()
+                .map(Job::getName)
+                .toList());
+    }
+
+    @Test
+    void updateJobReplacesJobAndResetsOmittedFieldsToDefaults() {
+        Job original = job("replace-me", "s3://scripts/v1.py");
+        original.setDescription("original description");
+        original.setDefaultArguments(Map.of("--source", "default"));
+        original.setMaxRetries(5);
+        original.setTimeout(100);
+        original.setGlueVersion("4.0");
+        original.setWorkerType("G.1X");
+        original.setNumberOfWorkers(2);
+        glueService.createJob(REGION, original);
+        Job created = glueService.getJob(REGION, "replace-me");
+
+        Job update = job("replace-me", "s3://scripts/v2.py");
+        glueService.updateJob(REGION, "replace-me", update);
+
+        Job fetched = glueService.getJob(REGION, "replace-me");
+        assertEquals("replace-me", fetched.getName());
+        assertEquals("s3://scripts/v2.py", fetched.getCommand().getScriptLocation());
+        assertEquals(created.getCreatedOn(), fetched.getCreatedOn());
+        assertNotNull(fetched.getLastModifiedOn());
+        assertNull(fetched.getDescription());
+        assertNull(fetched.getDefaultArguments());
+        assertEquals(0, fetched.getMaxRetries());
+        assertEquals(2880, fetched.getTimeout());
+        assertNull(fetched.getGlueVersion());
+        assertNull(fetched.getWorkerType());
+        assertNull(fetched.getNumberOfWorkers());
+    }
+
+    @Test
+    void updateJobRejectsNameChange() {
+        glueService.createJob(REGION, job("original-name", "s3://scripts/job.py"));
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> glueService.updateJob(REGION, "original-name", job("new-name", "s3://scripts/job.py")));
+
+        assertEquals("InvalidInputException", ex.getErrorCode());
+        assertEquals("original-name", glueService.getJob(REGION, "original-name").getName());
+    }
+
+    @Test
+    void updateJobForMissingJobThrows() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> glueService.updateJob(REGION, "missing", job("missing", "s3://scripts/job.py")));
+
+        assertEquals("EntityNotFoundException", ex.getErrorCode());
+    }
+
+    @Test
+    void getJobRunsReturnsRunsOrderedByStartedOnDescending() {
+        Job job = job("ordered", "s3://scripts/job.py");
+        job.setExecutionProperty(Map.of("MaxConcurrentRuns", 3));
+        String jobName = glueService.createJob(REGION, job);
+        JobRun oldest = glueService.startJobRun(REGION, jobName, null, null, null, null);
+        JobRun middle = glueService.startJobRun(REGION, jobName, null, null, null, null);
+        JobRun newest = glueService.startJobRun(REGION, jobName, null, null, null, null);
+        oldest.setStartedOn(Instant.parse("2026-01-01T00:00:00Z"));
+        middle.setStartedOn(Instant.parse("2026-01-02T00:00:00Z"));
+        newest.setStartedOn(Instant.parse("2026-01-03T00:00:00Z"));
+        glueService.persistJobRun(REGION, oldest);
+        glueService.persistJobRun(REGION, middle);
+        glueService.persistJobRun(REGION, newest);
+
+        List<JobRun> runs = glueService.getJobRuns(REGION, jobName);
+
+        assertEquals(List.of(newest.getId(), middle.getId(), oldest.getId()),
+                runs.stream().map(JobRun::getId).toList());
+    }
+
+    @Test
+    void getJobRunsDoesNotLeakRunsAcrossJobsWithColonNames() {
+        String etl = glueService.createJob(REGION, job("etl", "s3://scripts/etl.py"));
+        String nightly = glueService.createJob(REGION, job("etl:nightly", "s3://scripts/nightly.py"));
+        JobRun etlRun = glueService.startJobRun(REGION, etl, null, null, null, null);
+        JobRun nightlyRun = glueService.startJobRun(REGION, nightly, null, null, null, null);
+
+        List<JobRun> etlRuns = glueService.getJobRuns(REGION, etl);
+        List<JobRun> nightlyRuns = glueService.getJobRuns(REGION, nightly);
+
+        assertEquals(List.of(etlRun.getId()), etlRuns.stream().map(JobRun::getId).toList());
+        assertEquals(List.of(nightlyRun.getId()), nightlyRuns.stream().map(JobRun::getId).toList());
+    }
+
+    @Test
+    void startJobRunRejectsSecondConcurrentRunWithDefaultMaxConcurrentRuns() {
+        String jobName = glueService.createJob(REGION, job("serial", "s3://scripts/job.py"));
+        JobRun first = glueService.startJobRun(REGION, jobName, null, null, null, null);
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> glueService.startJobRun(REGION, jobName, null, null, null, null));
+
+        assertEquals("ConcurrentRunsExceededException", ex.getErrorCode());
+
+        glueService.batchStopJobRun(REGION, jobName, List.of(first.getId()));
+        JobRun second = glueService.startJobRun(REGION, jobName, null, null, null, null);
+        assertEquals("STARTING", second.getJobRunState());
+    }
+
+    @Test
+    void startJobRunAllowsConcurrentRunsWhenExecutionPropertyRaisesLimit() {
+        Job job = job("parallel", "s3://scripts/job.py");
+        job.setExecutionProperty(Map.of("MaxConcurrentRuns", 2));
+        String jobName = glueService.createJob(REGION, job);
+
+        glueService.startJobRun(REGION, jobName, null, null, null, null);
+        glueService.startJobRun(REGION, jobName, null, null, null, null);
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> glueService.startJobRun(REGION, jobName, null, null, null, null));
+        assertEquals("ConcurrentRunsExceededException", ex.getErrorCode());
+    }
+
     private Table tableReferencing(String registryName, String schemaName, Long versionNumber, String versionId) {
         Table table = new Table();
         table.setName("withref");
@@ -619,6 +841,17 @@ class GlueServiceTest {
         sd.setSchemaReference(ref);
         table.setStorageDescriptor(sd);
         return table;
+    }
+
+    private static Job job(String name, String scriptLocation) {
+        JobCommand command = new JobCommand();
+        command.setName("glueetl");
+        command.setScriptLocation(scriptLocation);
+        Job job = new Job();
+        job.setName(name);
+        job.setRole("arn:aws:iam::000000000000:role/glue-role");
+        job.setCommand(command);
+        return job;
     }
 
     private static final class InMemoryStorageFactory extends StorageFactory {

@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.glue.model.Database;
+import io.github.hectorvent.floci.services.glue.model.Job;
+import io.github.hectorvent.floci.services.glue.model.JobRun;
 import io.github.hectorvent.floci.services.glue.model.Partition;
 import io.github.hectorvent.floci.services.glue.model.Table;
 import io.github.hectorvent.floci.services.glue.model.UserDefinedFunction;
@@ -29,6 +31,7 @@ import java.util.Objects;
 public class GlueJsonHandler {
 
     private static final TypeReference<List<String>> STRING_LIST = new TypeReference<>() {};
+    private static final TypeReference<Map<String, String>> STRING_MAP = new TypeReference<>() {};
 
     private final GlueService glueService;
     private final GlueSchemaRegistryService schemaRegistryService;
@@ -116,6 +119,15 @@ public class GlueJsonHandler {
             case "GetUserDefinedFunctions" -> handleGetUserDefinedFunctions(request);
             case "UpdateUserDefinedFunction" -> handleUpdateUserDefinedFunction(request);
             case "DeleteUserDefinedFunction" -> handleDeleteUserDefinedFunction(request);
+            case "CreateJob" -> handleCreateJob(request, region);
+            case "GetJob" -> handleGetJob(request, region);
+            case "GetJobs" -> handleGetJobs(region);
+            case "UpdateJob" -> handleUpdateJob(request, region);
+            case "DeleteJob" -> handleDeleteJob(request, region);
+            case "StartJobRun" -> handleStartJobRun(request, region);
+            case "GetJobRun" -> handleGetJobRun(request, region);
+            case "GetJobRuns" -> handleGetJobRuns(request, region);
+            case "BatchStopJobRun" -> handleBatchStopJobRun(request, region);
             case "CreateRegistry" -> handleCreateRegistry(request, region);
             case "GetRegistry" -> handleGetRegistry(request, region);
             case "ListRegistries" -> handleListRegistries(request);
@@ -181,6 +193,69 @@ public class GlueJsonHandler {
         String functionName = request.get("FunctionName").asText();
         glueService.deleteUserDefinedFunction(dbName, functionName);
         return Response.ok().build();
+    }
+
+    private Response handleCreateJob(JsonNode request, String region) throws Exception {
+        Job job = mapper.treeToValue(request, Job.class);
+        String name = glueService.createJob(region, job);
+        return Response.ok(Map.of("Name", name)).build();
+    }
+
+    private Response handleGetJob(JsonNode request, String region) {
+        String name = request.get("JobName").asText();
+        return Response.ok(Map.of("Job", glueService.getJob(region, name))).build();
+    }
+
+    private Response handleGetJobs(String region) {
+        return Response.ok(Map.of("Jobs", glueService.getJobs(region))).build();
+    }
+
+    private Response handleUpdateJob(JsonNode request, String region) throws Exception {
+        String jobName = request.get("JobName").asText();
+        Job update = request.has("JobUpdate") && !request.get("JobUpdate").isNull()
+                ? mapper.treeToValue(request.get("JobUpdate"), Job.class)
+                : new Job();
+        glueService.updateJob(region, jobName, update);
+        return Response.ok(Map.of("JobName", jobName)).build();
+    }
+
+    private Response handleDeleteJob(JsonNode request, String region) {
+        String jobName = request.get("JobName").asText();
+        glueService.deleteJob(region, jobName);
+        return Response.ok(Map.of("JobName", jobName)).build();
+    }
+
+    private Response handleStartJobRun(JsonNode request, String region) {
+        String jobName = request.get("JobName").asText();
+        Map<String, String> arguments = request.has("Arguments")
+                ? mapper.convertValue(request.get("Arguments"), STRING_MAP)
+                : null;
+        JobRun run = glueService.startJobRun(
+                region,
+                jobName,
+                arguments,
+                request.has("Timeout") ? request.get("Timeout").asInt() : null,
+                request.path("WorkerType").asText(null),
+                request.has("NumberOfWorkers") ? request.get("NumberOfWorkers").asInt() : null);
+        return Response.ok(Map.of("JobRunId", run.getId())).build();
+    }
+
+    private Response handleGetJobRun(JsonNode request, String region) {
+        String jobName = request.get("JobName").asText();
+        String runId = request.get("RunId").asText();
+        return Response.ok(Map.of("JobRun", glueService.getJobRun(region, jobName, runId))).build();
+    }
+
+    private Response handleGetJobRuns(JsonNode request, String region) {
+        String jobName = request.get("JobName").asText();
+        return Response.ok(Map.of("JobRuns", glueService.getJobRuns(region, jobName))).build();
+    }
+
+    private Response handleBatchStopJobRun(JsonNode request, String region) {
+        String jobName = request.get("JobName").asText();
+        List<String> runIds = mapper.convertValue(request.get("JobRunIds"), STRING_LIST);
+        GlueService.BatchStopJobRunResult result = glueService.batchStopJobRun(region, jobName, runIds);
+        return Response.ok(result).build();
     }
 
     private Response handleCreateRegistry(JsonNode request, String region) {
